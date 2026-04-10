@@ -24,6 +24,7 @@ Think of Whisker as trace logging with batteries.
 """
 
 import asyncio
+import json
 import platform
 import sys
 import time
@@ -119,6 +120,7 @@ class WhiskerObserver(BaseObserver):
         batch_size: int = MAX_BATCH_SIZE_BYTES,
         exclude_frames: Tuple[Type[Frame], ...] = (InputAudioRawFrame, BotSpeakingFrame),
         file_name: Optional[str] = None,
+        log_file: Optional[str] = None,
         serializer: Optional[WhiskerSerializer] = None,
     ):
         """Initialize the Whisker observer.
@@ -132,6 +134,9 @@ class WhiskerObserver(BaseObserver):
             exclude_frames: Tuple of frame types to exclude from observation.
                 Defaults to (InputAudioRawFrame, BotSpeakingFrame).
             file_name: Optional file path to save the debugging session for later use.
+            log_file: Optional file path to write human-readable debug logs. Frame events
+                are written as structured text lines via a dedicated loguru sink, making it
+                easy to search and analyse pipeline behaviour with standard text tools.
             serializer: Optiona serializer used to serialize frames for sending to the client.
         """
         super().__init__()
@@ -154,6 +159,21 @@ class WhiskerObserver(BaseObserver):
         # Open file
         self._file = None
 
+        # Debug file logging via loguru sink
+        self._log_file = log_file
+        self._log_sink_id: Optional[int] = None
+        self._frame_logger = None
+        if self._log_file:
+            self._log_sink_id = logger.add(
+                self._log_file,
+                filter=lambda record: record["extra"].get("whisker_frame") is True,
+                format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<7} | {message}",
+                level="DEBUG",
+                rotation="10 MB",
+                encoding="utf-8",
+            )
+            self._frame_logger = logger.bind(whisker_frame=True)
+
     async def cleanup(self):
         """Clean up resources and close the Whisker server."""
         await super().cleanup()
@@ -165,6 +185,8 @@ class WhiskerObserver(BaseObserver):
         await self._stop_server()
 
         await self._maybe_close_file()
+
+        self._maybe_remove_log_sink()
 
     async def on_process_frame(self, data: FrameProcessed):
         """Handle frame processing events.
@@ -373,6 +395,8 @@ class WhiskerObserver(BaseObserver):
         }
         msg_packed = msgpack.packb(msg)
 
+        self._maybe_log_pipeline(processors, connections)
+
         await self._queue_data(msg_packed)
 
     def _frame_type(self, frame: Frame) -> str:
@@ -396,6 +420,7 @@ class WhiskerObserver(BaseObserver):
         direction = data.direction
         frame = data.frame
         frame_type = self._frame_type(frame)
+        payload = self._serializer(self, frame)
         msg = {
             "type": frame_type,
             "id": self._id,
@@ -404,9 +429,19 @@ class WhiskerObserver(BaseObserver):
             "event": "process",
             "direction": direction.name.lower(),
             "timestamp": time.time_ns() / 1_000_000,
-            "payload": self._serializer(self, frame),
+            "payload": payload,
         }
         msg_packed = msgpack.packb(msg)
+
+        self._maybe_log_frame(
+            id=self._id,
+            event="process",
+            direction=direction.name.lower(),
+            processor=processor.name,
+            frame_name=frame.name,
+            frame_type=frame_type,
+            payload=payload,
+        )
 
         await self._queue_data(msg_packed)
 
@@ -421,6 +456,7 @@ class WhiskerObserver(BaseObserver):
         direction = data.direction
         frame = data.frame
         frame_type = self._frame_type(frame)
+        payload = self._serializer(self, frame)
         msg = {
             "type": frame_type,
             "id": self._id,
@@ -429,9 +465,19 @@ class WhiskerObserver(BaseObserver):
             "event": "push",
             "direction": direction.name.lower(),
             "timestamp": time.time_ns() / 1_000_000,
-            "payload": self._serializer(self, frame),
+            "payload": payload,
         }
         msg_packed = msgpack.packb(msg)
+
+        self._maybe_log_frame(
+            id=self._id,
+            event="push",
+            direction=direction.name.lower(),
+            processor=processor.name,
+            frame_name=frame.name,
+            frame_type=frame_type,
+            payload=payload,
+        )
 
         await self._queue_data(msg_packed)
 
@@ -453,3 +499,72 @@ class WhiskerObserver(BaseObserver):
             pass
         except Exception as e:
             logger.warning(f"ᓚᘏᗢ Whisker: client closed with error: {e}")
+
+    # ------------------------------------------------------------------
+    # Debug file logging helpers
+    # ------------------------------------------------------------------
+
+    def _maybe_log_pipeline(self, processors: List[Dict], connections: List[Dict]):
+        """Log pipeline structure to the debug log file.
+
+        Args:
+            processors: List of processor dicts from the pipeline traversal.
+            connections: List of connection dicts from the pipeline traversal.
+        """
+        if not self._frame_logger:
+            return
+
+        self._frame_logger.info(
+            "PIPELINE | processors={p} connections={c}",
+            p=json.dumps(processors, ensure_ascii=False),
+            c=json.dumps(connections, ensure_ascii=False),
+        )
+
+    def _maybe_log_frame(
+        self,
+        *,
+        id: int,
+        event: str,
+        direction: str,
+        processor: str,
+        frame_name: str,
+        frame_type: str,
+        payload: Any,
+    ):
+        """Log a single frame event to the debug log file.
+
+        Args:
+            id: Monotonically increasing frame id.
+            event: Either ``"process"`` or ``"push"``.
+            direction: Either ``"upstream"`` or ``"downstream"``.
+            processor: Name of the processor that handled the frame.
+            frame_name: Human-readable name of the frame.
+            frame_type: Whisker message type (``"frame"``, ``"frame:whisker"``, etc.).
+            payload: Serialized frame payload.
+        """
+        if not self._frame_logger:
+            return
+
+        try:
+            payload_str = json.dumps(payload, ensure_ascii=False, default=str)
+        except TypeError:
+            payload_str = str(payload)
+
+        self._frame_logger.debug(
+            "FRAME #{id} | {event:<7} | {direction:<10} | {processor} | "
+            "{frame_name} ({frame_type}) | {payload}",
+            id=id,
+            event=event,
+            direction=direction,
+            processor=processor,
+            frame_name=frame_name,
+            frame_type=frame_type,
+            payload=payload_str,
+        )
+
+    def _maybe_remove_log_sink(self):
+        """Remove the loguru sink added for debug file logging."""
+        if self._log_sink_id is not None:
+            logger.remove(self._log_sink_id)
+            self._log_sink_id = None
+            self._frame_logger = None
